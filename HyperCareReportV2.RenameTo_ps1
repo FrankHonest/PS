@@ -1,0 +1,305 @@
+﻿[CmdLetBinding()]
+Param ( [Parameter(Position=1)][array]$SQLServerInstances = @("SERVER1","SERVER2")
+)
+
+$HTMLHeader = @"
+<style>
+ {
+    font-family: "Trebuchet MS", Arial, Helvetica, sans-serif;
+    border-collapse: collapse;
+    width: 100%;
+}
+
+td, #customers th {
+    border: 1px solid #ddd;
+    padding: 8px;
+}
+
+ tr:nth-child(even){background-color: #f2f2f2;}
+
+ tr:hover {background-color: #ddd;}
+
+th {
+    padding-top: 12px;
+    padding-bottom: 12px;
+    text-align: left;
+    background-color: #4CAF50;
+    color: white;
+}
+</style>
+<title>Report Title</title>
+"@
+
+function ReadSQLServer {
+
+    [CmdletBinding()]
+    param (        
+        [Parameter(Mandatory)]
+        [string[]]$SQLInstances,
+
+        [Parameter(Mandatory)]
+        [string ]$Database,
+        
+        [Parameter(Mandatory,
+                   ValueFromPipeline)]
+        [string] $Query
+        
+    )
+
+    $OverallQueryResults = @()
+
+
+    $connection = New-Object -TypeName System.Data.SqlClient.SqlConnection
+    
+    Foreach ( $SQLInstance in $SQLInstances)
+    {
+    
+        $connectionString = "Server=$SQLInstance;Database=$Database;Integrated Security=True;"
+        $connection.ConnectionString = $connectionString
+        $ErrorActionPreference = 'Stop'
+        
+        try {
+            $connection.Open()
+            Write-Verbose -Message "Connection to the $($connection.Database) database on $($connection.DataSource) has been successfully opened."
+        }
+        catch {
+            Write-Error -Message "An error has occurred. Error details: $($_.Exception.Message)"
+        }
+        
+        $ErrorActionPreference = 'Continue'
+        $command = $connection.CreateCommand()
+
+   
+        $command.CommandText = $Query
+        $ErrorActionPreference = 'Stop'
+
+        try {
+            $result = $command.ExecuteReader() 
+        }
+        catch {
+            Write-Error -Message "An error has occured. Error Details: $($_.Exception.Message)"
+        }
+
+        $ErrorActionPreference = 'Continue'
+
+            if ($result) {
+                $dataTable = New-Object -TypeName System.Data.DataTable
+                $dataTable.Load($result)
+                $OverallQueryResults +=  $dataTable | Select-Object * -ExcludeProperty ItemArray, RowError, RowState, Table, HasErrors
+            }
+
+        $connection.Close()
+
+    }
+
+    #Write-Host $OverallQueryResults | Select * | Format-Table
+    $OverallQueryResults
+}
+clear-host
+
+$SQLMemorUsageQuery = "SELECT @@servername as SQLInstanceName,physical_memory_in_use_kb/1024 AS [SQL Server Memory Usage (MB)],
+       large_page_allocations_kb, locked_page_allocations_kb, page_fault_count, 
+	   memory_utilization_percentage, available_commit_limit_kb, 
+	   process_physical_memory_low, process_virtual_memory_low
+FROM sys.dm_os_process_memory WITH (NOLOCK) OPTION (RECOMPILE);"
+
+
+$DriveLatencyQuery = "SELECT @@servername as SQLInstanceName,tab.[Drive], tab.volume_mount_point AS [Volume Mount Point], 
+	CASE 
+		WHEN num_of_reads = 0 THEN 0 
+		ELSE (io_stall_read_ms/num_of_reads) 
+	END AS [Read Latency],
+	CASE 
+		WHEN num_of_writes = 0 THEN 0 
+		ELSE (io_stall_write_ms/num_of_writes) 
+	END AS [Write Latency],
+	CASE 
+		WHEN (num_of_reads = 0 AND num_of_writes = 0) THEN 0 
+		ELSE (io_stall/(num_of_reads + num_of_writes)) 
+	END AS [Overall Latency],
+	CASE 
+		WHEN num_of_reads = 0 THEN 0 
+		ELSE (num_of_bytes_read/num_of_reads) 
+	END AS [Avg Bytes/Read],
+	CASE 
+		WHEN num_of_writes = 0 THEN 0 
+		ELSE (num_of_bytes_written/num_of_writes) 
+	END AS [Avg Bytes/Write],
+	CASE 
+		WHEN (num_of_reads = 0 AND num_of_writes = 0) THEN 0 
+		ELSE ((num_of_bytes_read + num_of_bytes_written)/(num_of_reads + num_of_writes)) 
+	END AS [Avg Bytes/Transfer]
+FROM (SELECT LEFT(UPPER(mf.physical_name), 2) AS Drive, SUM(num_of_reads) AS num_of_reads,
+	         SUM(io_stall_read_ms) AS io_stall_read_ms, SUM(num_of_writes) AS num_of_writes,
+	         SUM(io_stall_write_ms) AS io_stall_write_ms, SUM(num_of_bytes_read) AS num_of_bytes_read,
+	         SUM(num_of_bytes_written) AS num_of_bytes_written, SUM(io_stall) AS io_stall, vs.volume_mount_point 
+      FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+      INNER JOIN sys.master_files AS mf WITH (NOLOCK)
+      ON vfs.database_id = mf.database_id AND vfs.file_id = mf.file_id
+	  CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.[file_id]) AS vs 
+      GROUP BY LEFT(UPPER(mf.physical_name), 2), vs.volume_mount_point) AS tab
+ORDER BY [Overall Latency] OPTION (RECOMPILE);"
+
+
+$BackupQuery = " SELECT @@servername as SQLInstanceName,ISNULL(d.[name], bs.[database_name]) AS [Database], d.recovery_model_desc AS [Recovery Model], 
+       d.log_reuse_wait_desc AS [Log Reuse Wait Desc],
+    MAX(CASE WHEN [type] = 'D' THEN bs.backup_finish_date ELSE NULL END) AS [Last Full Backup],
+    MAX(CASE WHEN [type] = 'I' THEN bs.backup_finish_date ELSE NULL END) AS [Last Differential Backup],
+    MAX(CASE WHEN [type] = 'L' THEN bs.backup_finish_date ELSE NULL END) AS [Last Log Backup]
+FROM sys.databases AS d WITH (NOLOCK)
+LEFT OUTER JOIN msdb.dbo.backupset AS bs WITH (NOLOCK)
+ON bs.[database_name] = d.[name] 
+WHERE d.name <> N'tempdb'
+GROUP BY ISNULL(d.[name], bs.[database_name]), d.recovery_model_desc, d.log_reuse_wait_desc, d.[name] 
+ORDER BY d.recovery_model_desc, d.[name] OPTION (RECOMPILE);"
+
+$OSMemoryUsageQuery = "SELECT @@servername as SQLInstanceName,total_physical_memory_kb/1024 AS [Physical Memory (MB)], 
+       available_physical_memory_kb/1024 AS [Available Memory (MB)], 
+       total_page_file_kb/1024 AS [Total Page File (MB)], 
+	   available_page_file_kb/1024 AS [Available Page File (MB)], 
+	   system_cache_kb/1024 AS [System Cache (MB)],
+       system_memory_state_desc AS [System Memory State]
+FROM sys.dm_os_sys_memory WITH (NOLOCK) OPTION (RECOMPILE);"
+
+$DiskSpaceQuery = "SELECT DISTINCT @@servername as SQLInstanceName,vs.volume_mount_point, vs.file_system_type, 
+vs.logical_volume_name, CONVERT(DECIMAL(18,2),vs.total_bytes/1073741824.0) AS [Total Size (GB)],
+CONVERT(DECIMAL(18,2), vs.available_bytes/1073741824.0) AS [Available Size (GB)],  
+CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) AS [Space Free %]
+FROM sys.master_files AS f WITH (NOLOCK)
+CROSS APPLY sys.dm_os_volume_stats(f.database_id, f.[file_id]) AS vs 
+ORDER BY vs.volume_mount_point OPTION (RECOMPILE);"
+
+$CPUUsageQuery = "DECLARE @ts_now bigint = (SELECT cpu_ticks/(cpu_ticks/ms_ticks) FROM sys.dm_os_sys_info WITH (NOLOCK)); 
+
+SELECT TOP(60) @@servername as SQLInstanceName,SQLProcessUtilization AS [SQL Server Process CPU Utilization], 
+               SystemIdle AS [System Idle Process], 
+               100 - SystemIdle - SQLProcessUtilization AS [Other Process CPU Utilization], 
+               DATEADD(ms, -1 * (@ts_now - [timestamp]), GETDATE()) AS [Event Time] 
+FROM (SELECT record.value('(./Record/@id)[1]', 'int') AS record_id, 
+			record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') 
+			AS [SystemIdle], 
+			record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') 
+			AS [SQLProcessUtilization], [timestamp] 
+	  FROM (SELECT [timestamp], CONVERT(xml, record) AS [record] 
+			FROM sys.dm_os_ring_buffers WITH (NOLOCK)
+			WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' 
+			AND record LIKE N'%<SystemHealth>%') AS x) AS y 
+ORDER BY record_id DESC OPTION (RECOMPILE);"
+
+$PLEQuery = "SELECT @@SERVERNAME AS [SQLInstanceName], RTRIM([object_name]) AS [Object Name], instance_name, cntr_value AS [Page Life Expectancy]
+FROM sys.dm_os_performance_counters WITH (NOLOCK)
+WHERE [object_name] LIKE N'%Buffer Node%' -- Handles named instances
+AND counter_name = N'Page life expectancy' OPTION (RECOMPILE);"
+
+
+$Backup48HrsQuery="SELECT @@SERVERNAME AS [SQLInstanceName], bs.database_name AS [Database Name], bs.recovery_model,
+CONVERT (BIGINT, bs.backup_size / 1048576 ) AS [Uncompressed Backup Size (MB)],
+CONVERT (BIGINT, bs.compressed_backup_size / 1048576 ) AS [Compressed Backup Size (MB)],
+bs.is_copy_only, DATEDIFF (SECOND, bs.backup_start_date, bs.backup_finish_date) AS [Backup Elapsed Time (sec)],
+bs.backup_finish_date AS [Backup Finish Date], bmf.physical_device_name AS [Backup Location]
+FROM msdb.dbo.backupset AS bs WITH (NOLOCK)
+INNER JOIN msdb.dbo.backupmediafamily AS bmf WITH (NOLOCK)
+ON bs.media_set_id = bmf.media_set_id  
+WHERE DATEDIFF(HOUR,bs.backup_finish_date,getdate())<=48
+ORDER BY bs.backup_finish_date DESC OPTION (RECOMPILE);"
+
+$BlockingQuery = "SELECT @@SERVERNAME AS [SQLInstanceName],t1.resource_type AS [lock type], DB_NAME(resource_database_id) AS [database],
+t1.resource_associated_entity_id AS [blk object],t1.request_mode AS [lock req],  -- lock requested
+t1.request_session_id AS [waiter sid], t2.wait_duration_ms AS [wait time],       -- spid of waiter  
+(SELECT [text] FROM sys.dm_exec_requests AS r WITH (NOLOCK)                      -- get sql for waiter
+CROSS APPLY sys.dm_exec_sql_text(r.[sql_handle]) 
+WHERE r.session_id = t1.request_session_id) AS [waiter_batch],
+(SELECT SUBSTRING(qt.[text],r.statement_start_offset/2, 
+    (CASE WHEN r.statement_end_offset = -1 
+    THEN LEN(CONVERT(nvarchar(max), qt.[text])) * 2 
+    ELSE r.statement_end_offset END - r.statement_start_offset)/2) 
+FROM sys.dm_exec_requests AS r WITH (NOLOCK)
+CROSS APPLY sys.dm_exec_sql_text(r.[sql_handle]) AS qt
+WHERE r.session_id = t1.request_session_id) AS [waiter_stmt],					-- statement blocked
+t2.blocking_session_id AS [blocker sid],										-- spid of blocker
+(SELECT [text] FROM sys.sysprocesses AS p										-- get sql for blocker
+CROSS APPLY sys.dm_exec_sql_text(p.[sql_handle]) 
+WHERE p.spid = t2.blocking_session_id) AS [blocker_batch]
+FROM sys.dm_tran_locks AS t1 WITH (NOLOCK)
+INNER JOIN sys.dm_os_waiting_tasks AS t2 WITH (NOLOCK)
+ON t1.lock_owner_address = t2.resource_address OPTION (RECOMPILE);"
+
+$AGClusterQuery = "SELECT @@SERVERNAME AS [SQLInstanceName],cluster_name, quorum_type_desc, quorum_state_desc
+FROM sys.dm_hadr_cluster WITH (NOLOCK) OPTION (RECOMPILE);"
+
+$AGStatusQuery = "SELECT @@SERVERNAME AS [SQLInstanceName],ag.name AS [AG Name], ar.replica_server_name, ar.availability_mode_desc, adc.[database_name], 
+       drs.is_local, drs.is_primary_replica, drs.synchronization_state_desc,
+	   drs.synchronization_health_desc, 
+	   drs.database_state_desc 
+FROM sys.dm_hadr_database_replica_states AS drs WITH (NOLOCK)
+INNER JOIN sys.availability_databases_cluster AS adc WITH (NOLOCK)
+ON drs.group_id = adc.group_id 
+AND drs.group_database_id = adc.group_database_id
+INNER JOIN sys.availability_groups AS ag WITH (NOLOCK)
+ON ag.group_id = drs.group_id
+INNER JOIN sys.availability_replicas AS ar WITH (NOLOCK)
+ON drs.group_id = ar.group_id 
+AND drs.replica_id = ar.replica_id
+ORDER BY ag.name, ar.replica_server_name, adc.[database_name] OPTION (RECOMPILE);"
+
+$SQLJobsQuery = "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('Servername')) AS [SQLInstanceName],
+j.name as JobName ,
+case when j.enabled=1 then 'Yes' else 'No' end JobEnabled,
+sc.name AS JobCategory,js.last_run_date [LastRunDate(yyyymmdd)],
+STUFF(STUFF(RIGHT(REPLICATE('0', 6) +  CAST(js.last_run_time as varchar(6)), 6), 3, 0, ':'), 6, 0, ':') [LastRunTime(hhmmss)],
+jsd.next_run_date [NextRunDate(yyyymmdd)],
+STUFF(STUFF(RIGHT(REPLICATE('0', 6) +  CAST(jsd.next_run_time as varchar(6)), 6), 3, 0, ':'), 6, 0, ':') [NextRunTime(hhmmss)],
+case when js.last_run_outcome =0 then 'Fail' when js.last_run_outcome =1 then 'Succeed' when js.last_run_outcome=3 then 'Cancel' else 'Job never ran / JobHistory not available' end as JobLastRanStatus,
+js.last_outcome_message AS LastOutcomeMessage,
+js.last_run_duration AS [LanRanDuration(hhmmss)]
+FROM msdb.dbo.sysjobs j
+INNER JOIN msdb.dbo.syscategories sc ON
+j.category_id =
+sc.category_id
+LEFT OUTER JOIN msdb.dbo.sysoperators so ON
+j.notify_page_operator_id =
+so.id
+LEFT OUTER JOIN msdb.dbo.sysjobservers js ON
+j.job_id = js.job_id
+LEFT OUTER JOIN msdb.dbo.sysjobschedules jsd ON
+jsd.job_id = j.job_id
+LEFT OUTER JOIN msdb.dbo.sysschedules ssd ON
+jsd.schedule_id =
+ssd.schedule_id"
+
+$DBStatusQuery = "SELECT @@SERVERNAME AS [SQLInstanceName],name as DBName,databasepropertyex(name,'status') as DBStatus,databasepropertyex(name,'updateability') as Updateability from sys.databases"
+
+[String] $DBName = "master"
+
+$DriveLatencyResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $DriveLatencyQuery   | ConvertTo-HTML -Fragment -PreContent "<h3>Drive Latency</h3>"| Out-String
+$SQLMemorUsageResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $SQLMemorUsageQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>Memory Usage</h3>"| Out-String
+$BackupQueryResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $BackupQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>DatabaseBackup Status</h3>"| Out-String
+$OSMemoryUsageResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $OSMemoryUsageQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>OS Memory Status</h3>"| Out-String
+$DiskSpaceResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $DiskSpaceQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>Disk Space</h3>"| Out-String
+$CPUUsageResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $CPUUsageQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>CPU Usage</h3>"| Out-String
+$PLEResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $PLEQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>Page Life Expectancy</h3>"| Out-String
+$Backup48HrsResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $Backup48HrsQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>Past 48HrsBackup Status</h3>"| Out-String
+$BlockingResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $BlockingQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>SQL Server Blocking</h3>"| Out-String
+$SQLJobResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $SQLJobsQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>SQL Jobs Status</h3>"| Out-String
+
+if($BlockingResults.Length -eq  49)
+{
+
+    $BlockingResults = "<h3>SQL Server Blocking</h3><br> <h4> No blockings found </h4>"
+
+}
+
+$AGResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $AGClusterQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>AlwaysOn Nodes Status</h3>"| Out-String
+$AGStatusResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $AGStatusQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>AlwaysOn Synchronization Status</h3>"| Out-String
+$DBStatusResults = ReadSQLServer -SQLInstances $SQLServerInstances -Database $DBName -Query $DBStatusQuery  |  ConvertTo-HTML -Fragment -PreContent "<h3>Database Status</h3>"| Out-String
+
+
+
+$ReportDate = ConvertTo-Html -As Table -Fragment -PreContent " Report Created on: $(get-date)  " | Out-String 
+
+$HTMLBody = ConvertTo-HTML -PostContent "$DBStatusResults $AGResults $AGStatusResults $DriveLatencyResults $SQLMemorUsageResults $BackupQueryResults $OSMemoryUsageResults $DiskSpaceResults $CPUUsageResults $PLEResults $Backup48HrsResults $BlockingResults " -Head $HTMLHeader -PreContent "<h2>HyperCareReport -  PO1. WMS Program</h2><br>$ReportDate<br>" | Out-String
+
+
+Send-MailMessage -From "mail1@gmail.com" -To "mail2@gmail.com","mail3@gmail.com" -Subject "HyperCareReport -  PO1. WMS Program" -Body $HTMLBody -BodyAsHtml -SmtpServer "mail.smtp.server"
+
+#Send-MailMessage -From "mail1@gmail.com" -To "mail2@gmail.com" -Subject "HyperCareReport -  PO1. WMS Program" -Body $HTMLBody -BodyAsHtml -SmtpServer "mail.smtp.server"

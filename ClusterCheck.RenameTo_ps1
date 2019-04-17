@@ -1,0 +1,20 @@
+CLS
+$Servers= get-content "D:\_ClusterCheck\1.txt"
+
+
+Foreach ( $ServerName in $Servers)
+{
+
+try{
+
+    $sObj = Get-WmiObject -Class Win32_SystemServices -ComputerName $ServerName -ErrorAction Stop
+    if ($sObj | select PartComponent | where {$_ -like "*ClusSvc*"})
+    {Write-Output "$ServerName is Clustered"}
+    else
+    {Write-Output "$ServerName is Standalone"}
+
+    }
+catch {Write-Output "$ServerName no Access"}
+}
+Write-Output "/----------------THE END-----------------/"
+pause
